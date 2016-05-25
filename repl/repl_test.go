@@ -2,7 +2,7 @@
 // Use of this source code is governed by an Apache2
 // license that can be found in the LICENSE file.
 
-package runtime
+package repl
 
 import (
 	"bytes"
@@ -33,7 +33,7 @@ func TestOneShotEmptyBufferOneExpr(t *testing.T) {
 	var buffer bytes.Buffer
 	repl := newRepl(store, &buffer)
 	repl.OneShot("data.a[i].b.c[j] = 2")
-	expectOutput(t, buffer.String(), "+---+---+\n| i | j |\n+---+---+\n| 0 | 1 |\n+---+---+\n")
+	expectOutput(t, buffer.String(), "+---+---+\n| I | J |\n+---+---+\n| 0 | 1 |\n+---+---+\n")
 	buffer.Reset()
 	repl.OneShot("data.a[i].b.c[j] = \"deadbeef\"")
 	expectOutput(t, buffer.String(), "false\n")
@@ -56,7 +56,7 @@ func TestOneShotBufferedExpr(t *testing.T) {
 	repl.OneShot("2")
 	expectOutput(t, buffer.String(), "")
 	repl.OneShot("")
-	expectOutput(t, buffer.String(), "+---+---+\n| i | j |\n+---+---+\n| 0 | 1 |\n+---+---+\n")
+	expectOutput(t, buffer.String(), "+---+---+\n| I | J |\n+---+---+\n| 0 | 1 |\n+---+---+\n")
 }
 
 func TestOneShotBufferedRule(t *testing.T) {
@@ -65,7 +65,7 @@ func TestOneShotBufferedRule(t *testing.T) {
 	repl := newRepl(store, &buffer)
 	repl.OneShot("p[x] :- ")
 	expectOutput(t, buffer.String(), "")
-	repl.OneShot("a[i]")
+	repl.OneShot("data.a[i]")
 	expectOutput(t, buffer.String(), "")
 	repl.OneShot(" = ")
 	expectOutput(t, buffer.String(), "")
@@ -73,6 +73,56 @@ func TestOneShotBufferedRule(t *testing.T) {
 	expectOutput(t, buffer.String(), "")
 	repl.OneShot("")
 	expectOutput(t, buffer.String(), "defined\n")
+}
+
+func TestOneShotJSON(t *testing.T) {
+	store := newTestStorage()
+	var buffer bytes.Buffer
+	repl := newRepl(store, &buffer)
+	repl.OutputFormat = "json"
+	repl.OneShot("data.a[i] = x")
+	var expected interface{}
+	input := `
+	[
+		{
+			"i": 0,
+			"x": {
+			"b": {
+				"c": [
+				true,
+				2,
+				false
+				]
+			}
+			}
+		},
+		{
+			"i": 1,
+			"x": {
+			"b": {
+				"c": [
+				false,
+				true,
+				1
+				]
+			}
+			}
+		}
+	]
+	`
+	if err := json.Unmarshal([]byte(input), &expected); err != nil {
+		panic(err)
+	}
+
+	var result interface{}
+
+	if err := json.Unmarshal(buffer.Bytes(), &result); err != nil {
+		t.Errorf("Unexpected output format: %v", err)
+		return
+	}
+	if !reflect.DeepEqual(expected, result) {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
 }
 
 func TestBuildHeader(t *testing.T) {
@@ -94,9 +144,8 @@ func expectOutput(t *testing.T, output string, expected string) {
 	}
 }
 
-func newRepl(store *storage.DataStore, buffer *bytes.Buffer) *Repl {
-	runtime := &Runtime{DataStore: store}
-	repl := NewRepl(runtime, "", buffer)
+func newRepl(store *storage.DataStore, buffer *bytes.Buffer) *REPL {
+	repl := New(store, "", buffer, "")
 	return repl
 }
 

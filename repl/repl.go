@@ -2,7 +2,7 @@
 // Use of this source code is governed by an Apache2
 // license that can be found in the LICENSE file.
 
-package runtime
+package repl
 
 import (
 	"encoding/json"
@@ -12,23 +12,19 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/apcera/termtables"
+	"github.com/olekukonko/tablewriter"
 	"github.com/open-policy-agent/opa/ast"
-	"github.com/open-policy-agent/opa/eval"
 	"github.com/open-policy-agent/opa/storage"
+	"github.com/open-policy-agent/opa/topdown"
 	"github.com/peterh/liner"
 )
 
-const (
-	replStateInit   = iota
-	replStateBuffer = iota
-)
-
-// Repl represeents an instance of the interactive shell.
-type Repl struct {
+// REPL represents an instance of the interactive shell.
+type REPL struct {
 	Output       io.Writer
+	OutputFormat string
 	Trace        bool
-	Runtime      *Runtime
+	DataStore    *storage.DataStore
 	HistoryPath  string
 	InitPrompt   string
 	BufferPrompt string
@@ -36,12 +32,13 @@ type Repl struct {
 	nextID       int
 }
 
-// NewRepl creates a new Repl.
-func NewRepl(rt *Runtime, historyPath string, output io.Writer) *Repl {
-	return &Repl{
+// New returns a new instance of the REPL.
+func New(dataStore *storage.DataStore, historyPath string, output io.Writer, outputFormat string) *REPL {
+	return &REPL{
 		Output:       output,
+		OutputFormat: outputFormat,
 		Trace:        false,
-		Runtime:      rt,
+		DataStore:    dataStore,
 		HistoryPath:  historyPath,
 		InitPrompt:   "> ",
 		BufferPrompt: "| ",
@@ -49,7 +46,7 @@ func NewRepl(rt *Runtime, historyPath string, output io.Writer) *Repl {
 }
 
 // Loop will run until the user enters "exit", Ctrl+C, Ctrl+D, or an unexpected error occurs.
-func (r *Repl) Loop() {
+func (r *REPL) Loop() {
 
 	// Initialize the liner library.
 	line := liner.NewLiner()
@@ -84,12 +81,16 @@ func (r *Repl) Loop() {
 }
 
 // OneShot evaluates a single line and prints the result. Returns true if caller should exit.
-func (r *Repl) OneShot(line string) bool {
+func (r *REPL) OneShot(line string) bool {
 
 	if len(r.Buffer) == 0 {
 		switch strings.TrimSpace(strings.ToLower(line)) {
 		case "dump":
 			return r.cmdDump()
+		case "json":
+			return r.cmdFormat("json")
+		case "pretty":
+			return r.cmdFormat("pretty")
 		case "trace":
 			return r.cmdTrace()
 		case "?":
@@ -113,27 +114,34 @@ func (r *Repl) OneShot(line string) bool {
 	return false
 }
 
-func (r *Repl) cmdDump() bool {
-	fmt.Fprintln(r.Output, r.Runtime.DataStore)
+func (r *REPL) cmdDump() bool {
+	fmt.Fprintln(r.Output, r.DataStore)
 	return false
 }
 
-func (r *Repl) cmdExit() bool {
+func (r *REPL) cmdExit() bool {
+	return true
+}
+
+func (r *REPL) cmdFormat(s string) bool {
+	r.OutputFormat = s
 	return false
 }
 
-func (r *Repl) cmdHelp() bool {
+func (r *REPL) cmdHelp() bool {
 
 	commands := []struct {
 		name string
 		note string
 	}{
 		{"<stmt>", "evaluate the statement"},
+		{"json", "set output format to JSON"},
+		{"pretty", "set output format to pretty"},
 		{"dump", "dump the raw storage content"},
 		{"trace", "toggle stdout tracing"},
-		{"ctrl+l", "clear the screen"},
 		{"help", "print this message (or ?)"},
 		{"exit", "exit back to shell (or ctrl+c, ctrl+d, quit)"},
+		{"ctrl+l", "clear the screen"},
 	}
 
 	maxLength := 0
@@ -152,12 +160,12 @@ func (r *Repl) cmdHelp() bool {
 	return false
 }
 
-func (r *Repl) cmdTrace() bool {
+func (r *REPL) cmdTrace() bool {
 	r.Trace = !r.Trace
 	return false
 }
 
-func (r *Repl) compileBody(body ast.Body) (ast.Body, error) {
+func (r *REPL) compileBody(body ast.Body) (ast.Body, error) {
 	name := fmt.Sprintf("repl%d", r.nextID)
 	r.nextID++
 	rule := &ast.Rule{
@@ -180,7 +188,7 @@ func (r *Repl) compileBody(body ast.Body) (ast.Body, error) {
 	return c.Modules[name].Rules[0].Body, nil
 }
 
-func (r *Repl) compileRule(rule *ast.Rule) (*ast.Rule, error) {
+func (r *REPL) compileRule(rule *ast.Rule) (*ast.Rule, error) {
 	// TODO(tsandall): refactor to use current implicit module
 	// TODO(tsandall): refactor to update current implicit module
 	p := ast.Ref{ast.DefaultRootDocument}
@@ -198,7 +206,7 @@ func (r *Repl) compileRule(rule *ast.Rule) (*ast.Rule, error) {
 	return c.Modules["tmp"].Rules[0], nil
 }
 
-func (r *Repl) evalBufferOne() bool {
+func (r *REPL) evalBufferOne() bool {
 
 	line := strings.Join(r.Buffer, "\n")
 
@@ -225,7 +233,7 @@ func (r *Repl) evalBufferOne() bool {
 	return false
 }
 
-func (r *Repl) evalBufferMulti() bool {
+func (r *REPL) evalBufferMulti() bool {
 
 	line := strings.Join(r.Buffer, "\n")
 	r.Buffer = []string{}
@@ -248,7 +256,7 @@ func (r *Repl) evalBufferMulti() bool {
 	return false
 }
 
-func (r *Repl) evalStatement(stmt interface{}) bool {
+func (r *REPL) evalStatement(stmt interface{}) bool {
 	switch s := stmt.(type) {
 	case ast.Body:
 		s, err := r.compileBody(s)
@@ -268,11 +276,11 @@ func (r *Repl) evalStatement(stmt interface{}) bool {
 	return false
 }
 
-func (r *Repl) evalBody(body ast.Body) bool {
+func (r *REPL) evalBody(body ast.Body) bool {
 
-	ctx := eval.NewTopDownContext(body, r.Runtime.DataStore)
+	ctx := topdown.NewContext(body, r.DataStore)
 	if r.Trace {
-		ctx.Tracer = &eval.StdoutTracer{}
+		ctx.Tracer = &topdown.StdoutTracer{}
 	}
 
 	// Flag indicates whether the query was defined for some context.
@@ -286,14 +294,14 @@ func (r *Repl) evalBody(body ast.Body) bool {
 	var results []map[string]interface{}
 
 	// Execute query and accumulate results.
-	err := eval.TopDown(ctx, func(ctx *eval.TopDownContext) error {
+	err := topdown.Eval(ctx, func(ctx *topdown.Context) error {
 		var err error
 		row := map[string]interface{}{}
-		ctx.Bindings.Iter(func(k, v ast.Value) bool {
+		ctx.Locals.Iter(func(k, v ast.Value) bool {
 			if _, isVar := k.(ast.Var); !isVar {
 				return false
 			}
-			r, e := eval.ValueToInterface(v, ctx)
+			r, e := topdown.ValueToInterface(v, ctx)
 			if e != nil {
 				err = e
 				return true
@@ -334,16 +342,63 @@ func (r *Repl) evalBody(body ast.Body) bool {
 	return false
 }
 
-func (r *Repl) printResults(body ast.Body, results []map[string]interface{}) {
-	table := termtables.CreateTable()
-	r.printHeader(table, body)
-	for _, row := range results {
-		r.printRow(table, row)
+func (r *REPL) evalRule(rule *ast.Rule) bool {
+
+	path := []interface{}{string(rule.Name)}
+
+	if err := r.DataStore.Patch(storage.AddOp, path, []*ast.Rule{rule}); err != nil {
+		fmt.Fprintln(r.Output, "error:", err)
+		return true
 	}
-	fmt.Fprintf(r.Output, table.Render())
+
+	fmt.Fprintln(r.Output, "defined")
+	return false
 }
 
-func (r *Repl) printHeader(table *termtables.Table, body ast.Body) {
+func (r *REPL) getPrompt() string {
+	if len(r.Buffer) > 0 {
+		return r.BufferPrompt
+	}
+	return r.InitPrompt
+}
+
+func (r *REPL) loadHistory(prompt *liner.State) {
+	if f, err := os.Open(r.HistoryPath); err == nil {
+		prompt.ReadHistory(f)
+		f.Close()
+	}
+}
+
+func (r *REPL) printResults(body ast.Body, results []map[string]interface{}) {
+
+	switch r.OutputFormat {
+	case "json":
+		r.printJSON(results)
+	default:
+		r.printPretty(body, results)
+	}
+
+}
+
+func (r *REPL) printJSON(results []map[string]interface{}) {
+	buf, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		fmt.Fprintln(r.Output, err)
+		return
+	}
+	fmt.Fprintln(r.Output, string(buf))
+}
+
+func (r *REPL) printPretty(body ast.Body, results []map[string]interface{}) {
+	table := tablewriter.NewWriter(r.Output)
+	r.printPrettyHeader(table, body)
+	for _, row := range results {
+		r.printPrettyRow(table, row)
+	}
+	table.Render()
+}
+
+func (r *REPL) printPrettyHeader(table *tablewriter.Table, body ast.Body) {
 
 	// Build set of fields for the output. The fields are the variables from inside the body.
 	// If the variable appears multiple times, we only want a single field so store them in a
@@ -362,24 +417,17 @@ func (r *Repl) printHeader(table *termtables.Table, body ast.Body) {
 		}
 	}
 
-	// Store fields by name.
+	// Sort/display fields by name.
 	keys := []string{}
 	for k := range fields {
 		keys = append(keys, k)
 	}
 
 	sort.Strings(keys)
-
-	s := []interface{}{}
-	for _, k := range keys {
-		s = append(s, k)
-	}
-
-	// Add fields to table in sorted order.
-	table.AddHeaders(s...)
+	table.SetHeader(keys)
 }
 
-func (r *Repl) printRow(table *termtables.Table, row map[string]interface{}) {
+func (r *REPL) printPrettyRow(table *tablewriter.Table, row map[string]interface{}) {
 
 	// Arrange fields in same order as header.
 	keys := []string{}
@@ -389,48 +437,21 @@ func (r *Repl) printRow(table *termtables.Table, row map[string]interface{}) {
 
 	sort.Strings(keys)
 
-	buf := []interface{}{}
+	buf := []string{}
 	for _, k := range keys {
 		js, err := json.Marshal(row[k])
 		if err != nil {
-			buf = append(buf, err)
+			buf = append(buf, err.Error())
 		} else {
 			buf = append(buf, string(js))
 		}
 	}
 
 	// Add fields to table in sorted order.
-	table.AddRow(buf...)
+	table.Append(buf)
 }
 
-func (r *Repl) evalRule(rule *ast.Rule) bool {
-
-	path := []interface{}{string(rule.Name)}
-
-	if err := r.Runtime.DataStore.Patch(storage.AddOp, path, []*ast.Rule{rule}); err != nil {
-		fmt.Fprintln(r.Output, "error:", err)
-		return true
-	}
-
-	fmt.Fprintln(r.Output, "defined")
-	return false
-}
-
-func (r *Repl) getPrompt() string {
-	if len(r.Buffer) > 0 {
-		return r.BufferPrompt
-	}
-	return r.InitPrompt
-}
-
-func (r *Repl) loadHistory(prompt *liner.State) {
-	if f, err := os.Open(r.HistoryPath); err == nil {
-		prompt.ReadHistory(f)
-		f.Close()
-	}
-}
-
-func (r *Repl) saveHistory(prompt *liner.State) {
+func (r *REPL) saveHistory(prompt *liner.State) {
 	if f, err := os.Create(r.HistoryPath); err == nil {
 		prompt.WriteHistory(f)
 		f.Close()

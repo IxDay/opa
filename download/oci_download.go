@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -14,10 +16,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
+
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"oras.land/oras-go/pkg/content"
-	"oras.land/oras-go/pkg/oras"
+	"oras.land/oras-go/v2"
+	oraslib "oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/oci"
 
 	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/logging"
@@ -42,13 +48,13 @@ type OCIDownloader struct {
 	mtx            sync.Mutex
 	stopped        bool
 	persist        bool
-	store          *content.OCI
+	store          *oci.Store
 	etag           string
 }
 
 // New returns a new Downloader that can be started.
 func NewOCI(config Config, client rest.Client, path, storePath string) *OCIDownloader {
-	localstore, err := content.NewOCI(storePath)
+	localstore, err := oci.New(storePath)
 	if err != nil {
 		panic(err)
 	}
@@ -232,19 +238,20 @@ func (d *OCIDownloader) download(ctx context.Context, m metrics.Metrics) (*downl
 	d.client = d.client.WithHeader("Prefer", preferValue)
 
 	m.Timer(metrics.BundleRequest).Start()
-	_, layers, err := d.pull(ctx, d.path)
+	desc, err := d.pull(ctx, d.path)
 	if err != nil {
 		return &downloaderResponse{}, fmt.Errorf("failed to pull %s: %w", d.path, err)
 	}
-	//currently it has 3 as it has the manifest, tar and config layers
-	if len(layers) != 3 {
-		return nil, fmt.Errorf("expected 3 layers only")
+
+	manifest, err := manifestFromDesc(ctx, d.store, desc)
+	if err != nil {
+		return nil, err
 	}
 
 	tarballDescriptor := ocispec.Descriptor{}
-	for i := range layers {
-		if layers[i].MediaType == "application/vnd.oci.image.layer.v1.tar+gzip" {
-			tarballDescriptor = layers[i]
+	for _, descriptor := range manifest.Layers {
+		if descriptor.MediaType == "application/vnd.oci.image.layer.v1.tar+gzip" {
+			tarballDescriptor = descriptor
 			break
 		}
 	}
@@ -286,39 +293,25 @@ func (d *OCIDownloader) download(ctx context.Context, m metrics.Metrics) (*downl
 	}, nil
 }
 
-func (d *OCIDownloader) pull(ctx context.Context, ref string) (*ocispec.Descriptor, []ocispec.Descriptor, error) {
+func (d *OCIDownloader) pull(ctx context.Context, ref string) (*ocispec.Descriptor, error) {
 	authHeader := make(http.Header)
 	client, err := d.getHTTPClient(&authHeader)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	urlInfo, err := url.Parse(d.client.Config().URL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid host url %s: %w", d.client.Config().URL, err)
+		return nil, fmt.Errorf("invalid host url %s: %w", d.client.Config().URL, err)
 	}
-	resolver := docker.NewResolver(docker.ResolverOptions{
-		Hosts:   d.getResolverHost(client, urlInfo),
-		Headers: authHeader,
-	})
 
-	allowedMediaTypes := []string{
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/octet-stream",
-		"application/vnd.oci.image.config.v1+json",
-		"application/vnd.oci.image.layer.v1.tar+gzip",
-	}
-	var layers []ocispec.Descriptor
-	opts := []oras.CopyOpt{
-		oras.WithAllowedMediaTypes(allowedMediaTypes),
-		oras.WithAdditionalCachedMediaTypes(allowedMediaTypes...),
-		oras.WithLayerDescriptors(func(d []ocispec.Descriptor) { layers = d }),
-	}
-	manifestDescriptor, err := oras.Copy(ctx, resolver, ref, d.store, "", opts...)
+	target := newRemoteManager(d.getResolverHost(client, urlInfo), authHeader, ref)
+
+	manifestDescriptor, err := oraslib.Copy(ctx, target, ref, d.store, "", oraslib.DefaultCopyOptions)
 	if err != nil {
-		return nil, nil, fmt.Errorf("download for '%s' failed: %w", ref, err)
+		return nil, fmt.Errorf("download for '%s' failed: %w", ref, err)
 	}
 
-	return &manifestDescriptor, layers, nil
+	return &manifestDescriptor, nil
 }
 
 func (d *OCIDownloader) getResolverHost(client *http.Client, urlInfo *url.URL) docker.RegistryHosts {
@@ -381,4 +374,68 @@ func (d *OCIDownloader) getHTTPClient(authHeader *http.Header) (*http.Client, er
 		}
 	}
 	return client, nil
+}
+
+func manifestFromDesc(ctx context.Context, target oras.Target, desc *ocispec.Descriptor) (*ocispec.Manifest, error) {
+	var manifest ocispec.Manifest
+
+	descReader, err := target.Fetch(ctx, *desc)
+	if err != nil {
+		return nil, fmt.Errorf("unable to fetch descriptor with digest %q: %w", desc.Digest, err)
+	}
+	defer descReader.Close()
+
+	descBytes, err := io.ReadAll(descReader)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read bytes from descriptor: %w", err)
+	}
+
+	if err = json.Unmarshal(descBytes, &manifest); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal manifest: %w", err)
+	}
+
+	if len(manifest.Layers) < 1 {
+		return nil, fmt.Errorf("no layers in manifest")
+	}
+
+	return &manifest, nil
+}
+
+type remoteManager struct {
+	resolver remotes.Resolver
+	srcRef   string
+}
+
+func newRemoteManager(hosts docker.RegistryHosts, headers http.Header, srcRef string) *remoteManager {
+	resolver := docker.NewResolver(docker.ResolverOptions{
+		Hosts:   hosts,
+		Headers: headers,
+	})
+
+	return &remoteManager{resolver: resolver, srcRef: srcRef}
+}
+
+func (r *remoteManager) Resolve(ctx context.Context, ref string) (ocispec.Descriptor, error) {
+	_, desc, err := r.resolver.Resolve(ctx, ref)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	return desc, nil
+}
+
+func (r *remoteManager) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
+	fetcher, err := r.resolver.Fetcher(ctx, r.srcRef)
+	if err != nil {
+		return nil, err
+	}
+	return fetcher.Fetch(ctx, target)
+}
+
+func (r *remoteManager) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	_, err := r.Fetch(ctx, target)
+	if err == nil {
+		return true, nil
+	}
+
+	return !errdefs.IsNotFound(err), err
 }

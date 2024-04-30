@@ -329,6 +329,7 @@ func verifyX509CertificateChain(certs []*x509.Certificate) ([]*x509.Certificate,
 	verifyOpts := x509.VerifyOptions{
 		Roots:         roots,
 		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
 	chains, err := leaf.Verify(verifyOpts)
 	if err != nil {
